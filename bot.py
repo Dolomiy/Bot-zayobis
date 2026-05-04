@@ -3,7 +3,6 @@ Telegram-бот контролю обробки повернень на скла
 Запуск: python bot.py
 """
 
-import asyncio
 import logging
 import os
 import sys
@@ -65,7 +64,8 @@ REQUIRED_VARS = [
     "THREAD_ID",
     "RESPONSIBLE_USER_IDS",
     "ADMIN_USER_IDS",
-    "DEADLINES",
+    "WEEKDAY_DEADLINES",
+    "WEEKEND_DEADLINES",
     "TIMEZONE",
 ]
 
@@ -95,10 +95,14 @@ def load_config() -> dict:
         "THREAD_ID": int(os.environ["THREAD_ID"]),
         "RESPONSIBLE_USER_IDS": parse_ids("RESPONSIBLE_USER_IDS"),
         "ADMIN_USER_IDS": parse_ids("ADMIN_USER_IDS"),
-        "DEADLINES": parse_times("DEADLINES"),
+        # Будні (пн–пт): 11:00, 14:00, 17:00, 20:00
+        "WEEKDAY_DEADLINES": parse_times("WEEKDAY_DEADLINES"),
+        # Вихідні (сб–нд): 11:00, 12:00, 18:00
+        "WEEKEND_DEADLINES": parse_times("WEEKEND_DEADLINES"),
         "PRE_REMIND_MINUTES": int(os.getenv("PRE_REMIND_MINUTES", "60")),
         "FINAL_REMIND_MINUTES": int(os.getenv("FINAL_REMIND_MINUTES", "30")),
-        "WORKDAYS_ONLY": os.getenv("WORKDAYS_ONLY", "true").lower() == "true",
+        # Якщо true — вихідні повністю пропускаються (WEEKEND_DEADLINES ігноруються)
+        "WORKDAYS_ONLY": os.getenv("WORKDAYS_ONLY", "false").lower() == "true",
         "TIMEZONE": tz,
         "DB_PATH": os.getenv("DB_PATH", "returns.db"),
     }
@@ -212,8 +216,16 @@ def today_str() -> str:
     return now_local().strftime("%Y-%m-%d")
 
 
-def is_workday() -> bool:
-    return now_local().weekday() < 5  # 0=пн, 4=пт
+def is_workday(dt: datetime | None = None) -> bool:
+    """Повертає True якщо день — пн–пт."""
+    return (dt or now_local()).weekday() < 5
+
+
+def get_todays_deadlines() -> list[str]:
+    """Повертає список дедлайнів залежно від типу дня."""
+    if CFG["WORKDAYS_ONLY"] and not is_workday():
+        return []
+    return CFG["WEEKDAY_DEADLINES"] if is_workday() else CFG["WEEKEND_DEADLINES"]
 
 
 def deadline_dt(dl_time: str, ref_date: date | None = None) -> datetime:
@@ -238,16 +250,20 @@ def mention_users(user_ids: list[int]) -> str:
 
 def schedule_day_jobs(app: Application) -> None:
     """Планує завдання на сьогоднішній день."""
-    if CFG["WORKDAYS_ONLY"] and not is_workday():
-        log.info("Сьогодні вихідний — завдання не плануються.")
+    deadlines = get_todays_deadlines()
+    if not deadlines:
+        log.info("Сьогодні вихідний і WORKDAYS_ONLY=true — завдання не плануються.")
         return
+
+    day_label = "будній" if is_workday() else "вихідний"
+    log.info("Планування на %s день: %s", day_label, deadlines)
 
     now = now_local()
     jq = app.job_queue
     pre_min = CFG["PRE_REMIND_MINUTES"]
     final_min = CFG["FINAL_REMIND_MINUTES"]
 
-    for dl_time in CFG["DEADLINES"]:
+    for dl_time in deadlines:
         dl = deadline_dt(dl_time)
 
         # Перше нагадування
@@ -300,7 +316,6 @@ async def job_pre_remind(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if task and task["status"] in ("done", "skipped"):
         return
-
     if task and task["notified_pre"]:
         return
 
@@ -322,7 +337,6 @@ async def job_final_remind(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if task and task["status"] in ("done", "skipped"):
         return
-
     if task and task["notified_final"]:
         return
 
@@ -347,7 +361,7 @@ async def job_check_deadline(context: ContextTypes.DEFAULT_TYPE) -> None:
     task = await get_task(today_str(), dl_time)
 
     if task and task["status"] in ("done", "skipped"):
-        log.info("Дедлайн %s — вже виконано/пропущено, перевірка не потрібна.", dl_time)
+        log.info("Дедлайн %s — вже виконано/пропущено.", dl_time)
         return
 
     log.info("Дедлайн %s — фото не надійшло, позначаю як missed.", dl_time)
@@ -394,8 +408,9 @@ async def job_reschedule_day(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def restore_today_tasks(app: Application) -> None:
     """Відновлює активні слоти на сьогодні після перезапуску."""
-    if CFG["WORKDAYS_ONLY"] and not is_workday():
-        log.info("Відновлення: сьогодні вихідний.")
+    deadlines = get_todays_deadlines()
+    if not deadlines:
+        log.info("Відновлення: сьогодні вихідний і WORKDAYS_ONLY=true.")
         return
 
     today = today_str()
@@ -404,17 +419,14 @@ async def restore_today_tasks(app: Application) -> None:
     final_min = CFG["FINAL_REMIND_MINUTES"]
     jq = app.job_queue
 
-    for dl_time in CFG["DEADLINES"]:
+    for dl_time in deadlines:
         dl = deadline_dt(dl_time)
         task = await get_task(today, dl_time)
 
-        # Слот ще не існує — планувальник створить його при спрацюванні
-        # Слот вже done/skipped — нічого не робимо
         if task and task["status"] in ("done", "skipped", "missed"):
             log.info("Відновлення %s: статус %s — пропускаємо.", dl_time, task["status"])
             continue
 
-        # Перевіряємо, чи потрібно ще планувати окремі кроки
         pre_time = dl - timedelta(minutes=pre_min)
         final_time = dl - timedelta(minutes=final_min)
 
@@ -430,10 +442,10 @@ async def restore_today_tasks(app: Application) -> None:
             jq.run_once(job_check_deadline, when=dl, name=f"check_{dl_time}", data=dl_time)
             log.info("Відновлено: перевірка дедлайну %s о %s", dl_time, dl.strftime("%H:%M"))
         elif task is None or task["status"] == "pending":
-            # Дедлайн вже минув, а статус не встановлено — позначаємо missed
+            # Дедлайн минув під час офлайну — фіксуємо missed
             task_id = await ensure_task(today, dl_time)
             await mark_missed(task_id)
-            log.info("Відновлення: дедлайн %s минув під час офлайну — позначено missed.", dl_time)
+            log.info("Відновлення: дедлайн %s минув офлайн — позначено missed.", dl_time)
 
 
 # ---------------------------------------------------------------------------
@@ -452,17 +464,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if user_id not in CFG["RESPONSIBLE_USER_IDS"]:
         return
 
-    # Перевіряємо, що фото надіслано саме у THREAD_ID
+    # Фото повинно бути надіслано саме в наш THREAD_ID
     if msg.message_thread_id != CFG["THREAD_ID"]:
         return
 
     today = today_str()
     now = now_local()
     final_min = CFG["FINAL_REMIND_MINUTES"]
+    deadlines = get_todays_deadlines()
 
     # Шукаємо активний слот, де відкрите вікно прийому фото
     active_slot: dict | None = None
-    for dl_time in CFG["DEADLINES"]:
+    for dl_time in deadlines:
         dl = deadline_dt(dl_time)
         window_start = dl - timedelta(minutes=final_min)
 
@@ -476,12 +489,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     photo_file_id = msg.photo[-1].file_id  # найбільша версія
 
     if active_slot is None:
-        # Фото поза вікном
         await msg.reply_text("📸 Скрін отримано, але поза розкладом.")
         log.info("Фото від %d поза вікном прийому.", user_id)
         return
 
-    # Зараховуємо фото
     dl_time = active_slot["_dl_time"]
     task_id = active_slot["id"]
     await mark_done(task_id, photo_file_id, user_id)
@@ -493,9 +504,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         text=f"✅ Дедлайн {dl_time} — оброблено.",
     )
 
-    # Скасовуємо заплановану перевірку (якщо ще є)
-    current_jobs = context.job_queue.get_jobs_by_name(f"check_{dl_time}")
-    for job in current_jobs:
+    # Скасовуємо заплановану перевірку
+    for job in context.job_queue.get_jobs_by_name(f"check_{dl_time}"):
         job.schedule_removal()
 
     log.info("Фото від %d зараховано для дедлайну %s.", user_id, dl_time)
@@ -507,20 +517,27 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/status — статус усіх слотів за сьогодні."""
-    # Команда дозволена у гілці та в DM
     if not await _is_allowed_context(update):
         return
 
     today = today_str()
+    deadlines = get_todays_deadlines()
+    tasks = await get_tasks_for_date(today)
+
+    # Створюємо рядки для слотів, яких ще немає в БД
+    existing = {t["deadline_time"] for t in tasks}
+    for dl_time in deadlines:
+        if dl_time not in existing:
+            await ensure_task(today, dl_time)
     tasks = await get_tasks_for_date(today)
 
     if not tasks:
-        # Переконуємось, що слоти існують
-        for dl_time in CFG["DEADLINES"]:
-            await ensure_task(today, dl_time)
-        tasks = await get_tasks_for_date(today)
+        day_label = "будній" if is_workday() else "вихідний"
+        await update.message.reply_text(f"Сьогодні {day_label} день без активних слотів.")
+        return
 
-    lines = [f"📋 *Статус повернень за {today}*\n"]
+    day_label = "будній" if is_workday() else "вихідний"
+    lines = [f"📋 *Статус повернень за {today}* ({day_label})\n"]
     for t in tasks:
         icon = format_status_icon(t["status"])
         skip_note = f" — {t['skip_reason']}" if t.get("skip_reason") else ""
@@ -553,9 +570,7 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     lines = [f"📊 *Звіт за {report_date}*\n"]
     for t in tasks:
         icon = format_status_icon(t["status"])
-        confirmed = ""
-        if t.get("confirmed_at"):
-            confirmed = f" (підтв. {t['confirmed_at'][:16]})"
+        confirmed = f" (підтв. {t['confirmed_at'][:16]})" if t.get("confirmed_at") else ""
         skip_note = f" — {t['skip_reason']}" if t.get("skip_reason") else ""
         lines.append(f"{icon} `{t['deadline_time']}` — {t['status']}{confirmed}{skip_note}")
 
@@ -577,17 +592,18 @@ async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     dl_time = context.args[0]
     reason = " ".join(context.args[1:])
 
-    # Валідація формату HH:MM
     try:
         datetime.strptime(dl_time, "%H:%M")
     except ValueError:
         await update.message.reply_text("Невірний формат часу. Використовуйте HH:MM.")
         return
 
-    if dl_time not in CFG["DEADLINES"]:
+    # Перевіряємо проти розкладу поточного дня
+    todays_deadlines = get_todays_deadlines()
+    if dl_time not in todays_deadlines:
         await update.message.reply_text(
-            f"Дедлайн {dl_time} не знайдено в конфігурації.\n"
-            f"Доступні: {', '.join(CFG['DEADLINES'])}"
+            f"Дедлайн {dl_time} не знайдено в розкладі сьогодні.\n"
+            f"Доступні: {', '.join(todays_deadlines) or 'немає'}"
         )
         return
 
@@ -595,7 +611,6 @@ async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     task_id = await ensure_task(today, dl_time)
     await mark_skipped(task_id, reason)
 
-    # Скасовуємо заплановані завдання для цього слота
     jq = context.job_queue
     for suffix in ("pre", "final", "check"):
         for job in jq.get_jobs_by_name(f"{suffix}_{dl_time}"):
@@ -617,11 +632,9 @@ async def _is_allowed_context(update: Update) -> bool:
     if msg is None:
         return False
 
-    # DM — завжди дозволено
     if msg.chat.type == "private":
         return True
 
-    # Група — тільки у правильній гілці
     if (
         msg.chat_id == CFG["GROUP_CHAT_ID"]
         and msg.message_thread_id == CFG["THREAD_ID"]
@@ -636,7 +649,7 @@ async def _is_allowed_context(update: Update) -> bool:
 # ---------------------------------------------------------------------------
 
 async def check_bot_permissions(bot: Bot) -> None:
-    """Перевіряє, що бот є адміном у групі з правом на топіки."""
+    """Перевіряє, що бот є адміном у групі."""
     try:
         member = await bot.get_chat_member(CFG["GROUP_CHAT_ID"], bot.id)
         if member.status not in ("administrator", "creator"):
@@ -670,10 +683,11 @@ def main() -> None:
 
     log.info("Запуск бота...")
     log.info(
-        "Конфіг: GROUP=%d THREAD=%d DEADLINES=%s TZ=%s",
+        "Конфіг: GROUP=%d THREAD=%d БУДНІ=%s ВИХІДНІ=%s TZ=%s",
         CFG["GROUP_CHAT_ID"],
         CFG["THREAD_ID"],
-        CFG["DEADLINES"],
+        CFG["WEEKDAY_DEADLINES"],
+        CFG["WEEKEND_DEADLINES"],
         CFG["TIMEZONE"],
     )
 
@@ -684,12 +698,11 @@ def main() -> None:
         .build()
     )
 
-    # Обробники команд
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("skip", cmd_skip))
 
-    # Обробник фото тільки з груп (DM-фото ігноруємо)
+    # Фото приймаємо тільки з супергрупи
     app.add_handler(
         MessageHandler(
             filters.PHOTO & filters.ChatType.SUPERGROUP,
