@@ -1,0 +1,704 @@
+"""
+Telegram-бот контролю обробки повернень на складі.
+Запуск: python bot.py
+"""
+
+import asyncio
+import logging
+import os
+import sys
+from datetime import date, datetime, timedelta
+from logging.handlers import RotatingFileHandler
+from zoneinfo import ZoneInfo
+
+import aiosqlite
+from dotenv import load_dotenv
+from telegram import Bot, Update
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+# ---------------------------------------------------------------------------
+# Налаштування логування
+# ---------------------------------------------------------------------------
+
+def setup_logging() -> logging.Logger:
+    logger = logging.getLogger("returns_bot")
+    logger.setLevel(logging.DEBUG)
+
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    # Файловий обробник із ротацією (5 МБ × 3 файли)
+    fh = RotatingFileHandler("bot.log", maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+
+    # Консольний обробник
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
+
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    return logger
+
+
+log = setup_logging()
+
+# ---------------------------------------------------------------------------
+# Завантаження конфігурації
+# ---------------------------------------------------------------------------
+
+load_dotenv()
+
+REQUIRED_VARS = [
+    "BOT_TOKEN",
+    "GROUP_CHAT_ID",
+    "THREAD_ID",
+    "RESPONSIBLE_USER_IDS",
+    "ADMIN_USER_IDS",
+    "DEADLINES",
+    "TIMEZONE",
+]
+
+
+def load_config() -> dict:
+    missing = [v for v in REQUIRED_VARS if not os.getenv(v)]
+    if missing:
+        log.error("Відсутні обов'язкові змінні середовища: %s", ", ".join(missing))
+        sys.exit(1)
+
+    def parse_ids(key: str) -> list[int]:
+        return [int(x.strip()) for x in os.environ[key].split(",") if x.strip()]
+
+    def parse_times(key: str) -> list[str]:
+        return [t.strip() for t in os.environ[key].split(",") if t.strip()]
+
+    tz_name = os.environ["TIMEZONE"]
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        log.error("Невідома таймзона: %s", tz_name)
+        sys.exit(1)
+
+    return {
+        "BOT_TOKEN": os.environ["BOT_TOKEN"],
+        "GROUP_CHAT_ID": int(os.environ["GROUP_CHAT_ID"]),
+        "THREAD_ID": int(os.environ["THREAD_ID"]),
+        "RESPONSIBLE_USER_IDS": parse_ids("RESPONSIBLE_USER_IDS"),
+        "ADMIN_USER_IDS": parse_ids("ADMIN_USER_IDS"),
+        "DEADLINES": parse_times("DEADLINES"),
+        "PRE_REMIND_MINUTES": int(os.getenv("PRE_REMIND_MINUTES", "60")),
+        "FINAL_REMIND_MINUTES": int(os.getenv("FINAL_REMIND_MINUTES", "30")),
+        "WORKDAYS_ONLY": os.getenv("WORKDAYS_ONLY", "true").lower() == "true",
+        "TIMEZONE": tz,
+        "DB_PATH": os.getenv("DB_PATH", "returns.db"),
+    }
+
+
+CFG: dict = {}  # заповнюється у main()
+
+# ---------------------------------------------------------------------------
+# База даних
+# ---------------------------------------------------------------------------
+
+DB_PATH = ""  # визначається після завантаження CFG
+
+
+async def init_db() -> None:
+    """Ініціалізація схеми БД."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        with open("schema.sql", encoding="utf-8") as f:
+            await db.executescript(f.read())
+        await db.commit()
+    log.info("БД ініціалізовано: %s", DB_PATH)
+
+
+async def ensure_task(task_date: str, deadline_time: str) -> int:
+    """Повертає id рядка tasks, створює якщо немає."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO tasks (date, deadline_time) VALUES (?, ?)",
+            (task_date, deadline_time),
+        )
+        await db.commit()
+        async with db.execute(
+            "SELECT id FROM tasks WHERE date=? AND deadline_time=?",
+            (task_date, deadline_time),
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0]
+
+
+async def get_task(task_date: str, deadline_time: str) -> dict | None:
+    """Отримати рядок task як dict або None."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM tasks WHERE date=? AND deadline_time=?",
+            (task_date, deadline_time),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def set_notified_pre(task_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE tasks SET notified_pre=1 WHERE id=?", (task_id,))
+        await db.commit()
+
+
+async def set_notified_final(task_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE tasks SET notified_final=1 WHERE id=?", (task_id,))
+        await db.commit()
+
+
+async def mark_done(task_id: int, photo_file_id: str, user_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """UPDATE tasks
+               SET status='done', photo_file_id=?, confirmed_by_user_id=?, confirmed_at=?
+               WHERE id=?""",
+            (photo_file_id, user_id, datetime.utcnow().isoformat(), task_id),
+        )
+        await db.commit()
+
+
+async def mark_missed(task_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE tasks SET status='missed' WHERE id=?", (task_id,))
+        await db.commit()
+
+
+async def mark_skipped(task_id: int, reason: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE tasks SET status='skipped', skip_reason=? WHERE id=?",
+            (reason, task_id),
+        )
+        await db.commit()
+
+
+async def get_tasks_for_date(task_date: str) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM tasks WHERE date=? ORDER BY deadline_time",
+            (task_date,),
+        ) as cur:
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Допоміжні функції
+# ---------------------------------------------------------------------------
+
+def now_local() -> datetime:
+    """Поточний час у налаштованій таймзоні."""
+    return datetime.now(CFG["TIMEZONE"])
+
+
+def today_str() -> str:
+    return now_local().strftime("%Y-%m-%d")
+
+
+def is_workday() -> bool:
+    return now_local().weekday() < 5  # 0=пн, 4=пт
+
+
+def deadline_dt(dl_time: str, ref_date: date | None = None) -> datetime:
+    """Повертає datetime дедлайну у локальній TZ."""
+    if ref_date is None:
+        ref_date = now_local().date()
+    h, m = map(int, dl_time.split(":"))
+    return datetime(ref_date.year, ref_date.month, ref_date.day, h, m, tzinfo=CFG["TIMEZONE"])
+
+
+def format_status_icon(status: str) -> str:
+    return {"done": "✅", "pending": "⏳", "missed": "❌", "skipped": "⏭️"}.get(status, "❓")
+
+
+def mention_users(user_ids: list[int]) -> str:
+    return " ".join(f"[користувач](tg://user?id={uid})" for uid in user_ids)
+
+
+# ---------------------------------------------------------------------------
+# Планувальник завдань
+# ---------------------------------------------------------------------------
+
+def schedule_day_jobs(app: Application) -> None:
+    """Планує завдання на сьогоднішній день."""
+    if CFG["WORKDAYS_ONLY"] and not is_workday():
+        log.info("Сьогодні вихідний — завдання не плануються.")
+        return
+
+    now = now_local()
+    jq = app.job_queue
+    pre_min = CFG["PRE_REMIND_MINUTES"]
+    final_min = CFG["FINAL_REMIND_MINUTES"]
+
+    for dl_time in CFG["DEADLINES"]:
+        dl = deadline_dt(dl_time)
+
+        # Перше нагадування
+        pre_time = dl - timedelta(minutes=pre_min)
+        if pre_time > now:
+            jq.run_once(
+                job_pre_remind,
+                when=pre_time,
+                name=f"pre_{dl_time}",
+                data=dl_time,
+            )
+            log.info("Заплановано перше нагадування %s о %s", dl_time, pre_time.strftime("%H:%M"))
+
+        # Друге нагадування
+        final_time = dl - timedelta(minutes=final_min)
+        if final_time > now:
+            jq.run_once(
+                job_final_remind,
+                when=final_time,
+                name=f"final_{dl_time}",
+                data=dl_time,
+            )
+            log.info("Заплановано друге нагадування %s о %s", dl_time, final_time.strftime("%H:%M"))
+
+        # Перевірка на дедлайн
+        if dl > now:
+            jq.run_once(
+                job_check_deadline,
+                when=dl,
+                name=f"check_{dl_time}",
+                data=dl_time,
+            )
+            log.info("Заплановано перевірку дедлайну %s о %s", dl_time, dl.strftime("%H:%M"))
+
+    # Щодня о 00:01 перепланувати завдання на наступний день
+    tomorrow_midnight = now.replace(hour=0, minute=1, second=0, microsecond=0) + timedelta(days=1)
+    jq.run_once(
+        job_reschedule_day,
+        when=tomorrow_midnight,
+        name="daily_reschedule",
+        data=None,
+    )
+
+
+async def job_pre_remind(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Перше нагадування за PRE_REMIND_MINUTES до дедлайну."""
+    dl_time: str = context.job.data
+    task_id = await ensure_task(today_str(), dl_time)
+    task = await get_task(today_str(), dl_time)
+
+    if task and task["status"] in ("done", "skipped"):
+        return
+
+    if task and task["notified_pre"]:
+        return
+
+    log.info("Надсилаю перше нагадування для дедлайну %s", dl_time)
+    await context.bot.send_message(
+        chat_id=CFG["GROUP_CHAT_ID"],
+        message_thread_id=CFG["THREAD_ID"],
+        text=f"⏰ *Нагадування* (за {CFG['PRE_REMIND_MINUTES']} хв до {dl_time})\n\nОбробіть повернення.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    await set_notified_pre(task_id)
+
+
+async def job_final_remind(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Друге нагадування за FINAL_REMIND_MINUTES до дедлайну."""
+    dl_time: str = context.job.data
+    task_id = await ensure_task(today_str(), dl_time)
+    task = await get_task(today_str(), dl_time)
+
+    if task and task["status"] in ("done", "skipped"):
+        return
+
+    if task and task["notified_final"]:
+        return
+
+    log.info("Надсилаю друге нагадування для дедлайну %s", dl_time)
+    await context.bot.send_message(
+        chat_id=CFG["GROUP_CHAT_ID"],
+        message_thread_id=CFG["THREAD_ID"],
+        text=(
+            f"⚠️ *Термінове нагадування* (за {CFG['FINAL_REMIND_MINUTES']} хв до {dl_time})\n\n"
+            "Обробіть повернення та надайте фото.\n\n"
+            "_Надішліть фото підтвердження у цю гілку._"
+        ),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    await set_notified_final(task_id)
+
+
+async def job_check_deadline(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Перевірка виконання на момент дедлайну."""
+    dl_time: str = context.job.data
+    task_id = await ensure_task(today_str(), dl_time)
+    task = await get_task(today_str(), dl_time)
+
+    if task and task["status"] in ("done", "skipped"):
+        log.info("Дедлайн %s — вже виконано/пропущено, перевірка не потрібна.", dl_time)
+        return
+
+    log.info("Дедлайн %s — фото не надійшло, позначаю як missed.", dl_time)
+    await mark_missed(task_id)
+
+    mentions = mention_users(CFG["RESPONSIBLE_USER_IDS"])
+
+    # Публічне повідомлення у гілку
+    await context.bot.send_message(
+        chat_id=CFG["GROUP_CHAT_ID"],
+        message_thread_id=CFG["THREAD_ID"],
+        text=(
+            f"❌ *Дедлайн {dl_time} прострочено!*\n\n"
+            f"Відповідальні: {mentions}\n"
+            "Повернення не оброблено вчасно."
+        ),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    # Особисті повідомлення кожному відповідальному
+    for uid in CFG["RESPONSIBLE_USER_IDS"]:
+        try:
+            await context.bot.send_message(
+                chat_id=uid,
+                text=(
+                    f"❌ *Увага!* Ви не надали фото підтвердження до {dl_time}.\n"
+                    "Повернення позначено як прострочене. Будь ласка, вжийте заходів."
+                ),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception as e:
+            log.warning("Не вдалося надіслати DM користувачу %d: %s", uid, e)
+
+
+async def job_reschedule_day(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Щоденне перепланування завдань на новий день."""
+    log.info("Перепланування завдань на новий день.")
+    schedule_day_jobs(context.application)
+
+
+# ---------------------------------------------------------------------------
+# Відновлення стану після рестарту
+# ---------------------------------------------------------------------------
+
+async def restore_today_tasks(app: Application) -> None:
+    """Відновлює активні слоти на сьогодні після перезапуску."""
+    if CFG["WORKDAYS_ONLY"] and not is_workday():
+        log.info("Відновлення: сьогодні вихідний.")
+        return
+
+    today = today_str()
+    now = now_local()
+    pre_min = CFG["PRE_REMIND_MINUTES"]
+    final_min = CFG["FINAL_REMIND_MINUTES"]
+    jq = app.job_queue
+
+    for dl_time in CFG["DEADLINES"]:
+        dl = deadline_dt(dl_time)
+        task = await get_task(today, dl_time)
+
+        # Слот ще не існує — планувальник створить його при спрацюванні
+        # Слот вже done/skipped — нічого не робимо
+        if task and task["status"] in ("done", "skipped", "missed"):
+            log.info("Відновлення %s: статус %s — пропускаємо.", dl_time, task["status"])
+            continue
+
+        # Перевіряємо, чи потрібно ще планувати окремі кроки
+        pre_time = dl - timedelta(minutes=pre_min)
+        final_time = dl - timedelta(minutes=final_min)
+
+        if pre_time > now:
+            jq.run_once(job_pre_remind, when=pre_time, name=f"pre_{dl_time}", data=dl_time)
+            log.info("Відновлено: перше нагадування %s о %s", dl_time, pre_time.strftime("%H:%M"))
+
+        if final_time > now:
+            jq.run_once(job_final_remind, when=final_time, name=f"final_{dl_time}", data=dl_time)
+            log.info("Відновлено: друге нагадування %s о %s", dl_time, final_time.strftime("%H:%M"))
+
+        if dl > now:
+            jq.run_once(job_check_deadline, when=dl, name=f"check_{dl_time}", data=dl_time)
+            log.info("Відновлено: перевірка дедлайну %s о %s", dl_time, dl.strftime("%H:%M"))
+        elif task is None or task["status"] == "pending":
+            # Дедлайн вже минув, а статус не встановлено — позначаємо missed
+            task_id = await ensure_task(today, dl_time)
+            await mark_missed(task_id)
+            log.info("Відновлення: дедлайн %s минув під час офлайну — позначено missed.", dl_time)
+
+
+# ---------------------------------------------------------------------------
+# Обробка фотографій
+# ---------------------------------------------------------------------------
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробка вхідних фото у гілці групи."""
+    msg = update.message
+    if msg is None:
+        return
+
+    user_id = msg.from_user.id if msg.from_user else None
+
+    # Ігноруємо фото не від відповідальних мовчки
+    if user_id not in CFG["RESPONSIBLE_USER_IDS"]:
+        return
+
+    # Перевіряємо, що фото надіслано саме у THREAD_ID
+    if msg.message_thread_id != CFG["THREAD_ID"]:
+        return
+
+    today = today_str()
+    now = now_local()
+    final_min = CFG["FINAL_REMIND_MINUTES"]
+
+    # Шукаємо активний слот, де відкрите вікно прийому фото
+    active_slot: dict | None = None
+    for dl_time in CFG["DEADLINES"]:
+        dl = deadline_dt(dl_time)
+        window_start = dl - timedelta(minutes=final_min)
+
+        if window_start <= now <= dl:
+            task = await get_task(today, dl_time)
+            if task and task["status"] == "pending" and task["notified_final"]:
+                active_slot = task
+                active_slot["_dl_time"] = dl_time
+                break
+
+    photo_file_id = msg.photo[-1].file_id  # найбільша версія
+
+    if active_slot is None:
+        # Фото поза вікном
+        await msg.reply_text("📸 Скрін отримано, але поза розкладом.")
+        log.info("Фото від %d поза вікном прийому.", user_id)
+        return
+
+    # Зараховуємо фото
+    dl_time = active_slot["_dl_time"]
+    task_id = active_slot["id"]
+    await mark_done(task_id, photo_file_id, user_id)
+
+    # Підтвердження у гілку
+    await context.bot.send_message(
+        chat_id=CFG["GROUP_CHAT_ID"],
+        message_thread_id=CFG["THREAD_ID"],
+        text=f"✅ Дедлайн {dl_time} — оброблено.",
+    )
+
+    # Скасовуємо заплановану перевірку (якщо ще є)
+    current_jobs = context.job_queue.get_jobs_by_name(f"check_{dl_time}")
+    for job in current_jobs:
+        job.schedule_removal()
+
+    log.info("Фото від %d зараховано для дедлайну %s.", user_id, dl_time)
+
+
+# ---------------------------------------------------------------------------
+# Команди
+# ---------------------------------------------------------------------------
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/status — статус усіх слотів за сьогодні."""
+    # Команда дозволена у гілці та в DM
+    if not await _is_allowed_context(update):
+        return
+
+    today = today_str()
+    tasks = await get_tasks_for_date(today)
+
+    if not tasks:
+        # Переконуємось, що слоти існують
+        for dl_time in CFG["DEADLINES"]:
+            await ensure_task(today, dl_time)
+        tasks = await get_tasks_for_date(today)
+
+    lines = [f"📋 *Статус повернень за {today}*\n"]
+    for t in tasks:
+        icon = format_status_icon(t["status"])
+        skip_note = f" — {t['skip_reason']}" if t.get("skip_reason") else ""
+        lines.append(f"{icon} `{t['deadline_time']}` — {t['status']}{skip_note}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/report YYYY-MM-DD — звіт за вказану дату."""
+    if not await _is_allowed_context(update):
+        return
+
+    if not context.args:
+        await update.message.reply_text("Використання: /report YYYY-MM-DD")
+        return
+
+    report_date = context.args[0]
+    try:
+        datetime.strptime(report_date, "%Y-%m-%d")
+    except ValueError:
+        await update.message.reply_text("Невірний формат дати. Використовуйте YYYY-MM-DD.")
+        return
+
+    tasks = await get_tasks_for_date(report_date)
+    if not tasks:
+        await update.message.reply_text(f"Немає даних за {report_date}.")
+        return
+
+    lines = [f"📊 *Звіт за {report_date}*\n"]
+    for t in tasks:
+        icon = format_status_icon(t["status"])
+        confirmed = ""
+        if t.get("confirmed_at"):
+            confirmed = f" (підтв. {t['confirmed_at'][:16]})"
+        skip_note = f" — {t['skip_reason']}" if t.get("skip_reason") else ""
+        lines.append(f"{icon} `{t['deadline_time']}` — {t['status']}{confirmed}{skip_note}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/skip HH:MM причина — позначити слот як пропущений (тільки адміни)."""
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if user_id not in CFG["ADMIN_USER_IDS"]:
+        await update.message.reply_text("⛔ Ця команда доступна тільки адміністраторам.")
+        return
+
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("Використання: /skip HH:MM причина")
+        return
+
+    dl_time = context.args[0]
+    reason = " ".join(context.args[1:])
+
+    # Валідація формату HH:MM
+    try:
+        datetime.strptime(dl_time, "%H:%M")
+    except ValueError:
+        await update.message.reply_text("Невірний формат часу. Використовуйте HH:MM.")
+        return
+
+    if dl_time not in CFG["DEADLINES"]:
+        await update.message.reply_text(
+            f"Дедлайн {dl_time} не знайдено в конфігурації.\n"
+            f"Доступні: {', '.join(CFG['DEADLINES'])}"
+        )
+        return
+
+    today = today_str()
+    task_id = await ensure_task(today, dl_time)
+    await mark_skipped(task_id, reason)
+
+    # Скасовуємо заплановані завдання для цього слота
+    jq = context.job_queue
+    for suffix in ("pre", "final", "check"):
+        for job in jq.get_jobs_by_name(f"{suffix}_{dl_time}"):
+            job.schedule_removal()
+
+    await update.message.reply_text(
+        f"⏭️ Слот {dl_time} позначено як пропущений.\nПричина: {reason}"
+    )
+    log.info("Адмін %d пропустив слот %s: %s", user_id, dl_time, reason)
+
+
+# ---------------------------------------------------------------------------
+# Допоміжна перевірка контексту для команд
+# ---------------------------------------------------------------------------
+
+async def _is_allowed_context(update: Update) -> bool:
+    """Команда дозволена у правильній гілці або в DM."""
+    msg = update.message
+    if msg is None:
+        return False
+
+    # DM — завжди дозволено
+    if msg.chat.type == "private":
+        return True
+
+    # Група — тільки у правильній гілці
+    if (
+        msg.chat_id == CFG["GROUP_CHAT_ID"]
+        and msg.message_thread_id == CFG["THREAD_ID"]
+    ):
+        return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Перевірка прав бота
+# ---------------------------------------------------------------------------
+
+async def check_bot_permissions(bot: Bot) -> None:
+    """Перевіряє, що бот є адміном у групі з правом на топіки."""
+    try:
+        member = await bot.get_chat_member(CFG["GROUP_CHAT_ID"], bot.id)
+        if member.status not in ("administrator", "creator"):
+            log.warning(
+                "Бот не є адміністратором групи %d! "
+                "Надайте боту права адміністратора з дозволом на управління топіками.",
+                CFG["GROUP_CHAT_ID"],
+            )
+    except Exception as e:
+        log.error("Не вдалося перевірити права бота: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Точка входу
+# ---------------------------------------------------------------------------
+
+async def post_init(app: Application) -> None:
+    """Виконується після ініціалізації Application."""
+    await init_db()
+    await check_bot_permissions(app.bot)
+    await restore_today_tasks(app)
+    schedule_day_jobs(app)
+    log.info("Бот успішно запущено та налаштовано.")
+
+
+def main() -> None:
+    global CFG, DB_PATH
+
+    CFG = load_config()
+    DB_PATH = CFG["DB_PATH"]
+
+    log.info("Запуск бота...")
+    log.info(
+        "Конфіг: GROUP=%d THREAD=%d DEADLINES=%s TZ=%s",
+        CFG["GROUP_CHAT_ID"],
+        CFG["THREAD_ID"],
+        CFG["DEADLINES"],
+        CFG["TIMEZONE"],
+    )
+
+    app = (
+        Application.builder()
+        .token(CFG["BOT_TOKEN"])
+        .post_init(post_init)
+        .build()
+    )
+
+    # Обробники команд
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("report", cmd_report))
+    app.add_handler(CommandHandler("skip", cmd_skip))
+
+    # Обробник фото тільки з груп (DM-фото ігноруємо)
+    app.add_handler(
+        MessageHandler(
+            filters.PHOTO & filters.ChatType.SUPERGROUP,
+            handle_photo,
+        )
+    )
+
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
