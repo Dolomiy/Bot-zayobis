@@ -488,6 +488,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     photo_file_id = msg.photo[-1].file_id  # найбільша версія
 
+    # --- Перевірка тестового вікна (відповідь без запису в БД) ---
+    test_until: datetime | None = context.application.bot_data.get("test_photo_window")
+    if test_until is not None and now_local() <= test_until:
+        await context.bot.send_message(
+            chat_id=CFG["GROUP_CHAT_ID"],
+            message_thread_id=CFG["THREAD_ID"],
+            text="✅ [ТЕСТ] Фото отримано — бот бачить скрін і може його обробити.",
+        )
+        log.info("[ТЕСТ] Фото від %d прийнято в тестовому вікні.", user_id)
+        return
+
     if active_slot is None:
         await msg.reply_text("📸 Скрін отримано, але поза розкладом.")
         log.info("Фото від %d поза вікном прийому.", user_id)
@@ -623,6 +634,217 @@ async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Тестові команди (тільки для адмінів, не змінюють БД)
+# ---------------------------------------------------------------------------
+
+# Тривалість тестового вікна прийому фото (хвилини)
+TEST_PHOTO_WINDOW_MINUTES = 5
+
+
+def _is_admin(update: Update) -> bool:
+    uid = update.effective_user.id if update.effective_user else None
+    return uid in CFG["ADMIN_USER_IDS"]
+
+
+async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/test — довідка по тестових командах."""
+    if not _is_admin(update):
+        await update.message.reply_text("⛔ Доступно тільки адміністраторам.")
+        return
+
+    text = (
+        "🧪 *Тестові команди* \\(лише адміни, не впливають на БД\\)\n\n"
+        "`/test_remind` — надіслати перше нагадування \\[ТЕСТ\\] у гілку\n"
+        "`/test_final` — надіслати друге нагадування \\[ТЕСТ\\] у гілку "
+        f"\\+ відкрити вікно фото на {TEST_PHOTO_WINDOW_MINUTES} хв\n"
+        "`/test_missed` — симулювати прострочення \\(гілка \\+ DM відповідальним\\)\n"
+        "`/test_dm` — перевірити доставку DM відповідальним\n"
+        "`/test_photo_window` — статус тестового вікна фото"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
+
+
+async def cmd_test_remind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/test_remind — надіслати тестове перше нагадування у гілку."""
+    if not _is_admin(update):
+        await update.message.reply_text("⛔ Доступно тільки адміністраторам.")
+        return
+
+    pre_min = CFG["PRE_REMIND_MINUTES"]
+    await context.bot.send_message(
+        chat_id=CFG["GROUP_CHAT_ID"],
+        message_thread_id=CFG["THREAD_ID"],
+        text=(
+            f"⏰ *\\[ТЕСТ\\] Нагадування* \\(за {pre_min} хв до дедлайну\\)\n\n"
+            "Обробіть повернення\\."
+        ),
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+    await update.message.reply_text("✅ Тестове перше нагадування надіслано в гілку.")
+    log.info("[ТЕСТ] Перше нагадування надіслано адміном %d.", update.effective_user.id)
+
+
+async def cmd_test_final(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/test_final — тестове друге нагадування + відкриття вікна прийому фото."""
+    if not _is_admin(update):
+        await update.message.reply_text("⛔ Доступно тільки адміністраторам.")
+        return
+
+    final_min = CFG["FINAL_REMIND_MINUTES"]
+    await context.bot.send_message(
+        chat_id=CFG["GROUP_CHAT_ID"],
+        message_thread_id=CFG["THREAD_ID"],
+        text=(
+            f"⚠️ *\\[ТЕСТ\\] Термінове нагадування* \\(за {final_min} хв до дедлайну\\)\n\n"
+            "Обробіть повернення та надайте фото\\.\n\n"
+            "_Надішліть фото підтвердження у цю гілку\\._"
+        ),
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+    # Відкриваємо тестове вікно прийому фото
+    window_until = now_local() + timedelta(minutes=TEST_PHOTO_WINDOW_MINUTES)
+    context.application.bot_data["test_photo_window"] = window_until
+
+    # Автозакриття вікна через TEST_PHOTO_WINDOW_MINUTES хвилин
+    context.job_queue.run_once(
+        _job_close_test_window,
+        when=timedelta(minutes=TEST_PHOTO_WINDOW_MINUTES),
+        name="close_test_window",
+    )
+
+    until_str = window_until.strftime("%H:%M:%S")
+    await update.message.reply_text(
+        f"✅ Тестове друге нагадування надіслано в гілку.\n"
+        f"📸 Вікно прийому тестового фото відкрито до {until_str} \\(місцевий час\\)\\.\n"
+        f"Попросіть відповідального надіслати фото в гілку\\.",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+    log.info("[ТЕСТ] Вікно фото відкрито до %s адміном %d.", until_str, update.effective_user.id)
+
+
+async def cmd_test_missed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/test_missed — симуляція прострочення (гілка + DM), без запису в БД."""
+    if not _is_admin(update):
+        await update.message.reply_text("⛔ Доступно тільки адміністраторам.")
+        return
+
+    fake_time = now_local().strftime("%H:%M")
+    mentions = mention_users(CFG["RESPONSIBLE_USER_IDS"])
+
+    # Тестове публічне повідомлення у гілку
+    await context.bot.send_message(
+        chat_id=CFG["GROUP_CHAT_ID"],
+        message_thread_id=CFG["THREAD_ID"],
+        text=(
+            f"❌ *\\[ТЕСТ\\] Дедлайн {fake_time} прострочено\\!*\n\n"
+            f"Відповідальні: {mentions}\n"
+            "Повернення не оброблено вчасно\\."
+        ),
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+    # Тестові DM кожному відповідальному
+    dm_ok, dm_fail = [], []
+    for uid in CFG["RESPONSIBLE_USER_IDS"]:
+        try:
+            await context.bot.send_message(
+                chat_id=uid,
+                text=(
+                    f"❌ *\\[ТЕСТ\\]* Перевірка DM\\.\n"
+                    f"Це симуляція сповіщення про прострочення дедлайну {fake_time}\\."
+                ),
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            dm_ok.append(uid)
+        except Exception as e:
+            dm_fail.append(uid)
+            log.warning("[ТЕСТ] DM не надіслано %d: %s", uid, e)
+
+    lines = ["✅ Тест прострочення виконано.\n"]
+    lines.append(f"Гілка: повідомлення надіслано.")
+    if dm_ok:
+        lines.append(f"DM надіслано: {dm_ok}")
+    if dm_fail:
+        lines.append(
+            f"⚠️ DM НЕ надіслано: {dm_fail}\n"
+            "(Користувач має спочатку написати боту /start)"
+        )
+    await update.message.reply_text("\n".join(lines))
+    log.info("[ТЕСТ] Симуляція прострочення: dm_ok=%s dm_fail=%s", dm_ok, dm_fail)
+
+
+async def cmd_test_dm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/test_dm — перевірити доставку DM до кожного відповідального."""
+    if not _is_admin(update):
+        await update.message.reply_text("⛔ Доступно тільки адміністраторам.")
+        return
+
+    dm_ok, dm_fail = [], []
+    for uid in CFG["RESPONSIBLE_USER_IDS"]:
+        try:
+            await context.bot.send_message(
+                chat_id=uid,
+                text=(
+                    "📬 *\\[ТЕСТ\\]* Перевірка особистих повідомлень\\.\n"
+                    "Бот успішно доставляє DM на ваш акаунт\\."
+                ),
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            dm_ok.append(uid)
+        except Exception as e:
+            dm_fail.append(uid)
+            log.warning("[ТЕСТ] DM не надіслано %d: %s", uid, e)
+
+    lines = []
+    if dm_ok:
+        lines.append(f"✅ DM надіслано: {dm_ok}")
+    if dm_fail:
+        lines.append(
+            f"❌ DM не надіслано: {dm_fail}\n"
+            "Причина: користувач ще не писав боту.\n"
+            "Рішення: кожен відповідальний має написати боту /start у приватні повідомлення."
+        )
+    if not lines:
+        lines.append("Список відповідальних порожній.")
+    await update.message.reply_text("\n".join(lines))
+    log.info("[ТЕСТ] DM: ok=%s fail=%s", dm_ok, dm_fail)
+
+
+async def cmd_test_photo_window(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/test_photo_window — показати статус тестового вікна або закрити його."""
+    if not _is_admin(update):
+        await update.message.reply_text("⛔ Доступно тільки адміністраторам.")
+        return
+
+    test_until: datetime | None = context.application.bot_data.get("test_photo_window")
+    now = now_local()
+
+    if test_until is None or now > test_until:
+        context.application.bot_data.pop("test_photo_window", None)
+        await update.message.reply_text(
+            "📸 Тестове вікно прийому фото *закрито*\\.\n\n"
+            "Щоб відкрити: `/test_final`",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+    else:
+        remaining = int((test_until - now).total_seconds())
+        until_str = test_until.strftime("%H:%M:%S")
+        await update.message.reply_text(
+            f"📸 Тестове вікно *відкрито* до {until_str}\\.\n"
+            f"Залишилось: {remaining} сек\\.\n\n"
+            "Надішліть фото у гілку, щоб перевірити прийом\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+
+
+async def _job_close_test_window(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Автоматично закриває тестове вікно прийому фото."""
+    context.application.bot_data.pop("test_photo_window", None)
+    log.info("[ТЕСТ] Тестове вікно фото автоматично закрито.")
+
+
+# ---------------------------------------------------------------------------
 # Допоміжна перевірка контексту для команд
 # ---------------------------------------------------------------------------
 
@@ -701,6 +923,14 @@ def main() -> None:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("skip", cmd_skip))
+
+    # Тестові команди
+    app.add_handler(CommandHandler("test", cmd_test))
+    app.add_handler(CommandHandler("test_remind", cmd_test_remind))
+    app.add_handler(CommandHandler("test_final", cmd_test_final))
+    app.add_handler(CommandHandler("test_missed", cmd_test_missed))
+    app.add_handler(CommandHandler("test_dm", cmd_test_dm))
+    app.add_handler(CommandHandler("test_photo_window", cmd_test_photo_window))
 
     # Фото приймаємо тільки з супергрупи
     app.add_handler(
