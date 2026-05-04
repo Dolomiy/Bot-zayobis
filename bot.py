@@ -63,6 +63,7 @@ REQUIRED_VARS = [
     "GROUP_CHAT_ID",
     "THREAD_ID",
     "RESPONSIBLE_USER_IDS",
+    "RESPONSIBLE_USER_NAMES",
     "ADMIN_USER_IDS",
     "WEEKDAY_DEADLINES",
     "WEEKEND_DEADLINES",
@@ -94,6 +95,8 @@ def load_config() -> dict:
         "GROUP_CHAT_ID": int(os.environ["GROUP_CHAT_ID"]),
         "THREAD_ID": int(os.environ["THREAD_ID"]),
         "RESPONSIBLE_USER_IDS": parse_ids("RESPONSIBLE_USER_IDS"),
+        # @username теги для публічних згадок у гілці
+        "RESPONSIBLE_USER_NAMES": parse_times("RESPONSIBLE_USER_NAMES"),
         "ADMIN_USER_IDS": parse_ids("ADMIN_USER_IDS"),
         # Будні (пн–пт): 11:00, 14:00, 17:00, 20:00
         "WEEKDAY_DEADLINES": parse_times("WEEKDAY_DEADLINES"),
@@ -240,8 +243,9 @@ def format_status_icon(status: str) -> str:
     return {"done": "✅", "pending": "⏳", "missed": "❌", "skipped": "⏭️"}.get(status, "❓")
 
 
-def mention_users(user_ids: list[int]) -> str:
-    return " ".join(f"[користувач](tg://user?id={uid})" for uid in user_ids)
+def mention_users() -> str:
+    """Рядок з @username тегами відповідальних."""
+    return " ".join(CFG["RESPONSIBLE_USER_NAMES"])
 
 
 # ---------------------------------------------------------------------------
@@ -367,33 +371,18 @@ async def job_check_deadline(context: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("Дедлайн %s — фото не надійшло, позначаю як missed.", dl_time)
     await mark_missed(task_id)
 
-    mentions = mention_users(CFG["RESPONSIBLE_USER_IDS"])
+    mentions = mention_users()
 
-    # Публічне повідомлення у гілку
     await context.bot.send_message(
         chat_id=CFG["GROUP_CHAT_ID"],
         message_thread_id=CFG["THREAD_ID"],
         text=(
             f"❌ *Дедлайн {dl_time} прострочено!*\n\n"
-            f"Відповідальні: {mentions}\n"
+            f"{mentions}\n"
             "Повернення не оброблено вчасно."
         ),
         parse_mode=ParseMode.MARKDOWN,
     )
-
-    # Особисті повідомлення кожному відповідальному
-    for uid in CFG["RESPONSIBLE_USER_IDS"]:
-        try:
-            await context.bot.send_message(
-                chat_id=uid,
-                text=(
-                    f"❌ *Увага!* Ви не надали фото підтвердження до {dl_time}.\n"
-                    "Повернення позначено як прострочене. Будь ласка, вжийте заходів."
-                ),
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        except Exception as e:
-            log.warning("Не вдалося надіслати DM користувачу %d: %s", uid, e)
 
 
 async def job_reschedule_day(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -657,8 +646,7 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "`/test_remind` — надіслати перше нагадування \\[ТЕСТ\\] у гілку\n"
         "`/test_final` — надіслати друге нагадування \\[ТЕСТ\\] у гілку "
         f"\\+ відкрити вікно фото на {TEST_PHOTO_WINDOW_MINUTES} хв\n"
-        "`/test_missed` — симулювати прострочення \\(гілка \\+ DM відповідальним\\)\n"
-        "`/test_dm` — перевірити доставку DM відповідальним\n"
+        "`/test_missed` — симулювати прострочення з тегами у гілці\n"
         "`/test_photo_window` — статус тестового вікна фото"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
@@ -724,91 +712,27 @@ async def cmd_test_final(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def cmd_test_missed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/test_missed — симуляція прострочення (гілка + DM), без запису в БД."""
+    """/test_missed — симуляція прострочення у гілці з тегами, без запису в БД."""
     if not _is_admin(update):
         await update.message.reply_text("⛔ Доступно тільки адміністраторам.")
         return
 
     fake_time = now_local().strftime("%H:%M")
-    mentions = mention_users(CFG["RESPONSIBLE_USER_IDS"])
+    mentions = mention_users()
 
-    # Тестове публічне повідомлення у гілку
     await context.bot.send_message(
         chat_id=CFG["GROUP_CHAT_ID"],
         message_thread_id=CFG["THREAD_ID"],
         text=(
             f"❌ *\\[ТЕСТ\\] Дедлайн {fake_time} прострочено\\!*\n\n"
-            f"Відповідальні: {mentions}\n"
+            f"{mentions}\n"
             "Повернення не оброблено вчасно\\."
         ),
         parse_mode=ParseMode.MARKDOWN_V2,
     )
 
-    # Тестові DM кожному відповідальному
-    dm_ok, dm_fail = [], []
-    for uid in CFG["RESPONSIBLE_USER_IDS"]:
-        try:
-            await context.bot.send_message(
-                chat_id=uid,
-                text=(
-                    f"❌ *\\[ТЕСТ\\]* Перевірка DM\\.\n"
-                    f"Це симуляція сповіщення про прострочення дедлайну {fake_time}\\."
-                ),
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
-            dm_ok.append(uid)
-        except Exception as e:
-            dm_fail.append(uid)
-            log.warning("[ТЕСТ] DM не надіслано %d: %s", uid, e)
-
-    lines = ["✅ Тест прострочення виконано.\n"]
-    lines.append(f"Гілка: повідомлення надіслано.")
-    if dm_ok:
-        lines.append(f"DM надіслано: {dm_ok}")
-    if dm_fail:
-        lines.append(
-            f"⚠️ DM НЕ надіслано: {dm_fail}\n"
-            "(Користувач має спочатку написати боту /start)"
-        )
-    await update.message.reply_text("\n".join(lines))
-    log.info("[ТЕСТ] Симуляція прострочення: dm_ok=%s dm_fail=%s", dm_ok, dm_fail)
-
-
-async def cmd_test_dm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/test_dm — перевірити доставку DM до кожного відповідального."""
-    if not _is_admin(update):
-        await update.message.reply_text("⛔ Доступно тільки адміністраторам.")
-        return
-
-    dm_ok, dm_fail = [], []
-    for uid in CFG["RESPONSIBLE_USER_IDS"]:
-        try:
-            await context.bot.send_message(
-                chat_id=uid,
-                text=(
-                    "📬 *\\[ТЕСТ\\]* Перевірка особистих повідомлень\\.\n"
-                    "Бот успішно доставляє DM на ваш акаунт\\."
-                ),
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
-            dm_ok.append(uid)
-        except Exception as e:
-            dm_fail.append(uid)
-            log.warning("[ТЕСТ] DM не надіслано %d: %s", uid, e)
-
-    lines = []
-    if dm_ok:
-        lines.append(f"✅ DM надіслано: {dm_ok}")
-    if dm_fail:
-        lines.append(
-            f"❌ DM не надіслано: {dm_fail}\n"
-            "Причина: користувач ще не писав боту.\n"
-            "Рішення: кожен відповідальний має написати боту /start у приватні повідомлення."
-        )
-    if not lines:
-        lines.append("Список відповідальних порожній.")
-    await update.message.reply_text("\n".join(lines))
-    log.info("[ТЕСТ] DM: ok=%s fail=%s", dm_ok, dm_fail)
+    await update.message.reply_text("✅ Тестове повідомлення про прострочення надіслано у гілку.")
+    log.info("[ТЕСТ] Симуляція прострочення виконана адміном %d.", update.effective_user.id)
 
 
 async def cmd_test_photo_window(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -929,7 +853,6 @@ def main() -> None:
     app.add_handler(CommandHandler("test_remind", cmd_test_remind))
     app.add_handler(CommandHandler("test_final", cmd_test_final))
     app.add_handler(CommandHandler("test_missed", cmd_test_missed))
-    app.add_handler(CommandHandler("test_dm", cmd_test_dm))
     app.add_handler(CommandHandler("test_photo_window", cmd_test_photo_window))
 
     # Фото приймаємо тільки з супергрупи
