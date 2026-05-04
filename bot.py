@@ -327,8 +327,8 @@ async def job_pre_remind(context: ContextTypes.DEFAULT_TYPE) -> None:
     await context.bot.send_message(
         chat_id=CFG["GROUP_CHAT_ID"],
         message_thread_id=CFG["THREAD_ID"],
-        text=f"⏰ *Нагадування* (за {CFG['PRE_REMIND_MINUTES']} хв до {dl_time})\n\nОбробіть повернення.",
-        parse_mode=ParseMode.MARKDOWN,
+        text=f"⏰ <b>Нагадування</b> (за {CFG['PRE_REMIND_MINUTES']} хв до {dl_time})\n\nОбробіть повернення.",
+        parse_mode=ParseMode.HTML,
     )
     await set_notified_pre(task_id)
 
@@ -349,11 +349,11 @@ async def job_final_remind(context: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id=CFG["GROUP_CHAT_ID"],
         message_thread_id=CFG["THREAD_ID"],
         text=(
-            f"⚠️ *Термінове нагадування* (за {CFG['FINAL_REMIND_MINUTES']} хв до {dl_time})\n\n"
+            f"⚠️ <b>Термінове нагадування</b> (за {CFG['FINAL_REMIND_MINUTES']} хв до {dl_time})\n\n"
             "Обробіть повернення та надайте фото.\n\n"
-            "_Надішліть фото підтвердження у цю гілку._"
+            "<i>Надішліть фото підтвердження у цю гілку.</i>"
         ),
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
     )
     await set_notified_final(task_id)
 
@@ -377,11 +377,11 @@ async def job_check_deadline(context: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id=CFG["GROUP_CHAT_ID"],
         message_thread_id=CFG["THREAD_ID"],
         text=(
-            f"❌ *Дедлайн {dl_time} прострочено!*\n\n"
+            f"❌ <b>Дедлайн {dl_time} прострочено!</b>\n\n"
             f"{mentions}\n"
             "Повернення не оброблено вчасно."
         ),
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -537,13 +537,13 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     day_label = "будній" if is_workday() else "вихідний"
-    lines = [f"📋 *Статус повернень за {today}* ({day_label})\n"]
+    lines = [f"📋 <b>Статус повернень за {today}</b> ({day_label})\n"]
     for t in tasks:
         icon = format_status_icon(t["status"])
         skip_note = f" — {t['skip_reason']}" if t.get("skip_reason") else ""
-        lines.append(f"{icon} `{t['deadline_time']}` — {t['status']}{skip_note}")
+        lines.append(f"{icon} <code>{t['deadline_time']}</code> — {t['status']}{skip_note}")
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -567,14 +567,14 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(f"Немає даних за {report_date}.")
         return
 
-    lines = [f"📊 *Звіт за {report_date}*\n"]
+    lines = [f"📊 <b>Звіт за {report_date}</b>\n"]
     for t in tasks:
         icon = format_status_icon(t["status"])
         confirmed = f" (підтв. {t['confirmed_at'][:16]})" if t.get("confirmed_at") else ""
         skip_note = f" — {t['skip_reason']}" if t.get("skip_reason") else ""
-        lines.append(f"{icon} `{t['deadline_time']}` — {t['status']}{confirmed}{skip_note}")
+        lines.append(f"{icon} <code>{t['deadline_time']}</code> — {t['status']}{confirmed}{skip_note}")
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -642,14 +642,14 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     text = (
-        "🧪 *Тестові команди* \\(лише адміни, не впливають на БД\\)\n\n"
-        "`/test_remind` — надіслати перше нагадування \\[ТЕСТ\\] у гілку\n"
-        "`/test_final` — надіслати друге нагадування \\[ТЕСТ\\] у гілку "
-        f"\\+ відкрити вікно фото на {TEST_PHOTO_WINDOW_MINUTES} хв\n"
-        "`/test_missed` — симулювати прострочення з тегами у гілці\n"
-        "`/test_photo_window` — статус тестового вікна фото"
+        "🧪 <b>Тестові команди</b> (лише адміни, не впливають на БД)\n\n"
+        "/test_remind — надіслати перше нагадування [ТЕСТ] у гілку\n"
+        "/test_final — надіслати друге нагадування [ТЕСТ] у гілку "
+        f"+ відкрити вікно фото на {TEST_PHOTO_WINDOW_MINUTES} хв\n"
+        "/test_missed — симулювати прострочення з тегами у гілці\n"
+        "/test_photo_window — статус тестового вікна фото"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 async def cmd_test_remind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -663,10 +663,10 @@ async def cmd_test_remind(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         chat_id=CFG["GROUP_CHAT_ID"],
         message_thread_id=CFG["THREAD_ID"],
         text=(
-            f"⏰ *\\[ТЕСТ\\] Нагадування* \\(за {pre_min} хв до дедлайну\\)\n\n"
-            "Обробіть повернення\\."
+            f"⏰ <b>[ТЕСТ] Нагадування</b> (за {pre_min} хв до дедлайну)\n\n"
+            "Обробіть повернення."
         ),
-        parse_mode=ParseMode.MARKDOWN_V2,
+        parse_mode=ParseMode.HTML,
     )
     await update.message.reply_text("✅ Тестове перше нагадування надіслано в гілку.")
     log.info("[ТЕСТ] Перше нагадування надіслано адміном %d.", update.effective_user.id)
@@ -683,11 +683,11 @@ async def cmd_test_final(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         chat_id=CFG["GROUP_CHAT_ID"],
         message_thread_id=CFG["THREAD_ID"],
         text=(
-            f"⚠️ *\\[ТЕСТ\\] Термінове нагадування* \\(за {final_min} хв до дедлайну\\)\n\n"
-            "Обробіть повернення та надайте фото\\.\n\n"
-            "_Надішліть фото підтвердження у цю гілку\\._"
+            f"⚠️ <b>[ТЕСТ] Термінове нагадування</b> (за {final_min} хв до дедлайну)\n\n"
+            "Обробіть повернення та надайте фото.\n\n"
+            "<i>Надішліть фото підтвердження у цю гілку.</i>"
         ),
-        parse_mode=ParseMode.MARKDOWN_V2,
+        parse_mode=ParseMode.HTML,
     )
 
     # Відкриваємо тестове вікно прийому фото
@@ -704,9 +704,8 @@ async def cmd_test_final(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     until_str = window_until.strftime("%H:%M:%S")
     await update.message.reply_text(
         f"✅ Тестове друге нагадування надіслано в гілку.\n"
-        f"📸 Вікно прийому тестового фото відкрито до {until_str} \\(місцевий час\\)\\.\n"
-        f"Попросіть відповідального надіслати фото в гілку\\.",
-        parse_mode=ParseMode.MARKDOWN_V2,
+        f"📸 Вікно прийому тестового фото відкрито до {until_str} (місцевий час).\n"
+        f"Попросіть відповідального надіслати фото в гілку.",
     )
     log.info("[ТЕСТ] Вікно фото відкрито до %s адміном %d.", until_str, update.effective_user.id)
 
@@ -724,11 +723,11 @@ async def cmd_test_missed(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         chat_id=CFG["GROUP_CHAT_ID"],
         message_thread_id=CFG["THREAD_ID"],
         text=(
-            f"❌ *\\[ТЕСТ\\] Дедлайн {fake_time} прострочено\\!*\n\n"
+            f"❌ <b>[ТЕСТ] Дедлайн {fake_time} прострочено!</b>\n\n"
             f"{mentions}\n"
-            "Повернення не оброблено вчасно\\."
+            "Повернення не оброблено вчасно."
         ),
-        parse_mode=ParseMode.MARKDOWN_V2,
+        parse_mode=ParseMode.HTML,
     )
 
     await update.message.reply_text("✅ Тестове повідомлення про прострочення надіслано у гілку.")
@@ -747,18 +746,18 @@ async def cmd_test_photo_window(update: Update, context: ContextTypes.DEFAULT_TY
     if test_until is None or now > test_until:
         context.application.bot_data.pop("test_photo_window", None)
         await update.message.reply_text(
-            "📸 Тестове вікно прийому фото *закрито*\\.\n\n"
-            "Щоб відкрити: `/test_final`",
-            parse_mode=ParseMode.MARKDOWN_V2,
+            "📸 Тестове вікно прийому фото <b>закрито</b>.\n\n"
+            "Щоб відкрити: /test_final",
+            parse_mode=ParseMode.HTML,
         )
     else:
         remaining = int((test_until - now).total_seconds())
         until_str = test_until.strftime("%H:%M:%S")
         await update.message.reply_text(
-            f"📸 Тестове вікно *відкрито* до {until_str}\\.\n"
-            f"Залишилось: {remaining} сек\\.\n\n"
-            "Надішліть фото у гілку, щоб перевірити прийом\\.",
-            parse_mode=ParseMode.MARKDOWN_V2,
+            f"📸 Тестове вікно <b>відкрито</b> до {until_str}.\n"
+            f"Залишилось: {remaining} сек.\n\n"
+            "Надішліть фото у гілку, щоб перевірити прийом.",
+            parse_mode=ParseMode.HTML,
         )
 
 
