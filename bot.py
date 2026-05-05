@@ -346,7 +346,7 @@ async def job_pre_remind(context: ContextTypes.DEFAULT_TYPE) -> None:
     await context.bot.send_message(
         chat_id=CFG["GROUP_CHAT_ID"],
         message_thread_id=CFG["THREAD_ID"],
-        text=f"⏰ До дедлайну <b>{dl_time}</b> залишилась година.\n\nНе забудьте обробити повернення та підготувати фото.",
+        text=f"⏰ До дедлайну <b>{dl_time}</b> залишилась година.\n\nОбробіть повернення.",
         parse_mode=ParseMode.HTML,
     )
     await set_notified_pre(task_id)
