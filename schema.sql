@@ -4,7 +4,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     date             TEXT    NOT NULL,          -- YYYY-MM-DD
     deadline_time    TEXT    NOT NULL,          -- HH:MM
-    status           TEXT    NOT NULL DEFAULT 'pending',  -- pending / done / missed / skipped
+    status           TEXT    NOT NULL DEFAULT 'pending',  -- pending / done / done_late / missed / skipped
     photo_file_id    TEXT,
     confirmed_by_user_id INTEGER,
     confirmed_at     TEXT,                      -- ISO datetime

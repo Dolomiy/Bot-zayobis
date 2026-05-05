@@ -104,6 +104,8 @@ def load_config() -> dict:
         "WEEKEND_DEADLINES": parse_times("WEEKEND_DEADLINES"),
         "PRE_REMIND_MINUTES": int(os.getenv("PRE_REMIND_MINUTES", "60")),
         "FINAL_REMIND_MINUTES": int(os.getenv("FINAL_REMIND_MINUTES", "30")),
+        # Вікно прийому пізнього фото після дедлайну (хвилини)
+        "LATE_ACCEPT_MINUTES": int(os.getenv("LATE_ACCEPT_MINUTES", "30")),
         # Якщо true — вихідні повністю пропускаються (WEEKEND_DEADLINES ігноруються)
         "WORKDAYS_ONLY": os.getenv("WORKDAYS_ONLY", "false").lower() == "true",
         "TIMEZONE": tz,
@@ -175,7 +177,18 @@ async def mark_done(task_id: int, photo_file_id: str, user_id: int) -> None:
             """UPDATE tasks
                SET status='done', photo_file_id=?, confirmed_by_user_id=?, confirmed_at=?
                WHERE id=?""",
-            (photo_file_id, user_id, datetime.utcnow().isoformat(), task_id),
+            (photo_file_id, user_id, now_local().isoformat(), task_id),
+        )
+        await db.commit()
+
+
+async def mark_done_late(task_id: int, photo_file_id: str, user_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """UPDATE tasks
+               SET status='done_late', photo_file_id=?, confirmed_by_user_id=?, confirmed_at=?
+               WHERE id=?""",
+            (photo_file_id, user_id, now_local().isoformat(), task_id),
         )
         await db.commit()
 
@@ -240,7 +253,13 @@ def deadline_dt(dl_time: str, ref_date: date | None = None) -> datetime:
 
 
 def format_status_icon(status: str) -> str:
-    return {"done": "✅", "pending": "⏳", "missed": "❌", "skipped": "⏭️"}.get(status, "❓")
+    return {
+        "done": "✅",
+        "done_late": "⚠️",
+        "pending": "⏳",
+        "missed": "❌",
+        "skipped": "⏭️",
+    }.get(status, "❓")
 
 
 def mention_users() -> str:
@@ -359,16 +378,48 @@ async def job_final_remind(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def job_check_deadline(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Перевірка виконання на момент дедлайну."""
+    """На момент дедлайну: якщо фото не надійшло — відкриваємо пізнє вікно."""
     dl_time: str = context.job.data
     task_id = await ensure_task(today_str(), dl_time)
     task = await get_task(today_str(), dl_time)
 
-    if task and task["status"] in ("done", "skipped"):
+    if task and task["status"] in ("done", "done_late", "skipped"):
         log.info("Дедлайн %s — вже виконано/пропущено.", dl_time)
         return
 
-    log.info("Дедлайн %s — фото не надійшло, позначаю як missed.", dl_time)
+    late_min = CFG["LATE_ACCEPT_MINUTES"]
+    log.info("Дедлайн %s — фото не надійшло, відкриваю пізнє вікно %d хв.", dl_time, late_min)
+
+    await context.bot.send_message(
+        chat_id=CFG["GROUP_CHAT_ID"],
+        message_thread_id=CFG["THREAD_ID"],
+        text=(
+            f"⏰ <b>Дедлайн {dl_time}</b> — фото ще не надійшло.\n"
+            f"Є ще <b>{late_min} хв</b> для надсилання фото підтвердження."
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+
+    # Запланувати фінальну перевірку після пізнього вікна
+    context.job_queue.run_once(
+        job_late_check,
+        when=timedelta(minutes=late_min),
+        name=f"late_{dl_time}",
+        data=dl_time,
+    )
+
+
+async def job_late_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Фінальна перевірка після закінчення пізнього вікна."""
+    dl_time: str = context.job.data
+    task_id = await ensure_task(today_str(), dl_time)
+    task = await get_task(today_str(), dl_time)
+
+    if task and task["status"] in ("done", "done_late", "skipped"):
+        log.info("Пізня перевірка %s — оброблено/пропущено.", dl_time)
+        return
+
+    log.info("Пізня перевірка %s — фото так і не надійшло, позначаю missed.", dl_time)
     await mark_missed(task_id)
 
     mentions = mention_users()
@@ -406,18 +457,20 @@ async def restore_today_tasks(app: Application) -> None:
     now = now_local()
     pre_min = CFG["PRE_REMIND_MINUTES"]
     final_min = CFG["FINAL_REMIND_MINUTES"]
+    late_min = CFG["LATE_ACCEPT_MINUTES"]
     jq = app.job_queue
 
     for dl_time in deadlines:
         dl = deadline_dt(dl_time)
         task = await get_task(today, dl_time)
 
-        if task and task["status"] in ("done", "skipped", "missed"):
+        if task and task["status"] in ("done", "done_late", "skipped", "missed"):
             log.info("Відновлення %s: статус %s — пропускаємо.", dl_time, task["status"])
             continue
 
         pre_time = dl - timedelta(minutes=pre_min)
         final_time = dl - timedelta(minutes=final_min)
+        late_until = dl + timedelta(minutes=late_min)
 
         if pre_time > now:
             jq.run_once(job_pre_remind, when=pre_time, name=f"pre_{dl_time}", data=dl_time)
@@ -430,11 +483,15 @@ async def restore_today_tasks(app: Application) -> None:
         if dl > now:
             jq.run_once(job_check_deadline, when=dl, name=f"check_{dl_time}", data=dl_time)
             log.info("Відновлено: перевірка дедлайну %s о %s", dl_time, dl.strftime("%H:%M"))
+        elif now <= late_until:
+            # Дедлайн минув під час офлайну, але пізнє вікно ще відкрите
+            jq.run_once(job_late_check, when=late_until, name=f"late_{dl_time}", data=dl_time)
+            log.info("Відновлено: пізня перевірка %s о %s", dl_time, late_until.strftime("%H:%M"))
         elif task is None or task["status"] == "pending":
-            # Дедлайн минув під час офлайну — фіксуємо missed
+            # Пізнє вікно теж минуло офлайн — фіксуємо missed
             task_id = await ensure_task(today, dl_time)
             await mark_missed(task_id)
-            log.info("Відновлення: дедлайн %s минув офлайн — позначено missed.", dl_time)
+            log.info("Відновлення: %s минув офлайн (разом з пізнім вікном) — missed.", dl_time)
 
 
 # ---------------------------------------------------------------------------
@@ -460,26 +517,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     today = today_str()
     now = now_local()
     final_min = CFG["FINAL_REMIND_MINUTES"]
+    late_min = CFG["LATE_ACCEPT_MINUTES"]
     deadlines = get_todays_deadlines()
-
-    # Шукаємо активний слот, де відкрите вікно прийому фото
-    active_slot: dict | None = None
-    for dl_time in deadlines:
-        dl = deadline_dt(dl_time)
-        window_start = dl - timedelta(minutes=final_min)
-
-        if window_start <= now <= dl:
-            task = await get_task(today, dl_time)
-            if task and task["status"] == "pending" and task["notified_final"]:
-                active_slot = task
-                active_slot["_dl_time"] = dl_time
-                break
 
     photo_file_id = msg.photo[-1].file_id  # найбільша версія
 
     # --- Перевірка тестового вікна (відповідь без запису в БД) ---
     test_until: datetime | None = context.application.bot_data.get("test_photo_window")
-    if test_until is not None and now_local() <= test_until:
+    if test_until is not None and now <= test_until:
         await context.bot.send_message(
             chat_id=CFG["GROUP_CHAT_ID"],
             message_thread_id=CFG["THREAD_ID"],
@@ -488,27 +533,43 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         log.info("[ТЕСТ] Фото від %d прийнято в тестовому вікні.", user_id)
         return
 
-    if active_slot is None:
-        await msg.reply_text("📸 Скрін отримано, але поза розкладом.")
-        log.info("Фото від %d поза вікном прийому.", user_id)
-        return
+    for dl_time in deadlines:
+        dl = deadline_dt(dl_time)
+        window_start = dl - timedelta(minutes=final_min)
+        late_until = dl + timedelta(minutes=late_min)
 
-    dl_time = active_slot["_dl_time"]
-    task_id = active_slot["id"]
-    await mark_done(task_id, photo_file_id, user_id)
+        # Звичайне вікно: від другого нагадування до дедлайну
+        if window_start <= now <= dl:
+            task = await get_task(today, dl_time)
+            if task and task["status"] == "pending" and task["notified_final"]:
+                await mark_done(task["id"], photo_file_id, user_id)
+                await context.bot.send_message(
+                    chat_id=CFG["GROUP_CHAT_ID"],
+                    message_thread_id=CFG["THREAD_ID"],
+                    text=f"✅ Дедлайн {dl_time} — оброблено.",
+                )
+                for job in context.job_queue.get_jobs_by_name(f"check_{dl_time}"):
+                    job.schedule_removal()
+                log.info("Фото від %d зараховано (вчасно) для %s.", user_id, dl_time)
+                return
 
-    # Підтвердження у гілку
-    await context.bot.send_message(
-        chat_id=CFG["GROUP_CHAT_ID"],
-        message_thread_id=CFG["THREAD_ID"],
-        text=f"✅ Дедлайн {dl_time} — оброблено.",
-    )
+        # Пізнє вікно: від дедлайну до дедлайну + LATE_ACCEPT_MINUTES
+        if dl < now <= late_until:
+            task = await get_task(today, dl_time)
+            if task and task["status"] == "pending":
+                await mark_done_late(task["id"], photo_file_id, user_id)
+                await context.bot.send_message(
+                    chat_id=CFG["GROUP_CHAT_ID"],
+                    message_thread_id=CFG["THREAD_ID"],
+                    text=f"⚠️ Дедлайн {dl_time} — оброблено із запізненням.",
+                )
+                for job in context.job_queue.get_jobs_by_name(f"late_{dl_time}"):
+                    job.schedule_removal()
+                log.info("Фото від %d зараховано (пізно) для %s.", user_id, dl_time)
+                return
 
-    # Скасовуємо заплановану перевірку
-    for job in context.job_queue.get_jobs_by_name(f"check_{dl_time}"):
-        job.schedule_removal()
-
-    log.info("Фото від %d зараховано для дедлайну %s.", user_id, dl_time)
+    await msg.reply_text("📸 Скрін отримано, але поза розкладом.")
+    log.info("Фото від %d поза вікном прийому.", user_id)
 
 
 # ---------------------------------------------------------------------------
@@ -620,6 +681,37 @@ async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"⏭️ Слот {dl_time} позначено як пропущений.\nПричина: {reason}"
     )
     log.info("Адмін %d пропустив слот %s: %s", user_id, dl_time, reason)
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/help — список доступних команд залежно від ролі."""
+    if not await _is_allowed_context(update):
+        return
+
+    user_id = update.effective_user.id if update.effective_user else None
+    is_admin = user_id in CFG["ADMIN_USER_IDS"]
+
+    lines = [
+        "📖 <b>Доступні команди</b>\n",
+        "/status — статус слотів за сьогодні",
+        "/report YYYY-MM-DD — звіт за будь-яку дату",
+        "/help — ця довідка",
+    ]
+
+    if is_admin:
+        lines += [
+            "\n🔧 <b>Адмін</b>",
+            "/skip HH:MM причина — пропустити слот",
+            "/test — тестові команди (не впливають на БД)",
+        ]
+
+    lines += [
+        "\n📸 <b>Як підтвердити виконання</b>",
+        f"Надішліть фото у цю гілку протягом {CFG['FINAL_REMIND_MINUTES']} хв до або "
+        f"{CFG['LATE_ACCEPT_MINUTES']} хв після дедлайну.",
+    ]
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 # ---------------------------------------------------------------------------
@@ -847,6 +939,7 @@ def main() -> None:
         .build()
     )
 
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("skip", cmd_skip))
