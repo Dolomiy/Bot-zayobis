@@ -346,7 +346,7 @@ async def job_pre_remind(context: ContextTypes.DEFAULT_TYPE) -> None:
     await context.bot.send_message(
         chat_id=CFG["GROUP_CHAT_ID"],
         message_thread_id=CFG["THREAD_ID"],
-        text=f"⏰ <b>Нагадування</b> (за {CFG['PRE_REMIND_MINUTES']} хв до {dl_time})\n\nОбробіть повернення.",
+        text=f"⏰ До дедлайну <b>{dl_time}</b> залишилась година.\n\nНе забудьте обробити повернення та підготувати фото.",
         parse_mode=ParseMode.HTML,
     )
     await set_notified_pre(task_id)
@@ -368,9 +368,8 @@ async def job_final_remind(context: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id=CFG["GROUP_CHAT_ID"],
         message_thread_id=CFG["THREAD_ID"],
         text=(
-            f"⚠️ <b>Термінове нагадування</b> (за {CFG['FINAL_REMIND_MINUTES']} хв до {dl_time})\n\n"
-            "Обробіть повернення та надайте фото.\n\n"
-            "<i>Надішліть фото підтвердження у цю гілку.</i>"
+            f"🔔 До дедлайну <b>{dl_time}</b> залишилось {CFG['FINAL_REMIND_MINUTES']} хвилин.\n\n"
+            "Обробіть повернення і скиньте фото в цю гілку — ще є час зробити все вчасно."
         ),
         parse_mode=ParseMode.HTML,
     )
@@ -396,7 +395,7 @@ async def job_check_deadline(context: ContextTypes.DEFAULT_TYPE) -> None:
         message_thread_id=CFG["THREAD_ID"],
         text=(
             f"⚠️ {mentions}\n\n"
-            f"Дедлайн {dl_time} минув — фото не надійшло!\n"
+            f"Дедлайн <b>{dl_time}</b> минув — фото не надійшло!\n"
             f"Є ще <b>{late_min} хв</b>. Скиньте скрін прямо зараз."
         ),
         parse_mode=ParseMode.HTML,
@@ -430,9 +429,8 @@ async def job_late_check(context: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id=CFG["GROUP_CHAT_ID"],
         message_thread_id=CFG["THREAD_ID"],
         text=(
-            f"❌ <b>Дедлайн {dl_time} прострочено!</b>\n\n"
-            f"{mentions}\n"
-            "Повернення не оброблено вчасно."
+            f"🚫 {mentions}\n"
+            f"<b>{dl_time}</b> прострочено. Повернення не оброблено."
         ),
         parse_mode=ParseMode.HTML,
     )
