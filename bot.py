@@ -390,12 +390,14 @@ async def job_check_deadline(context: ContextTypes.DEFAULT_TYPE) -> None:
     late_min = CFG["LATE_ACCEPT_MINUTES"]
     log.info("Дедлайн %s — фото не надійшло, відкриваю пізнє вікно %d хв.", dl_time, late_min)
 
+    mentions = mention_users()
     await context.bot.send_message(
         chat_id=CFG["GROUP_CHAT_ID"],
         message_thread_id=CFG["THREAD_ID"],
         text=(
-            f"⏰ <b>Дедлайн {dl_time}</b> — фото ще не надійшло.\n"
-            f"Є ще <b>{late_min} хв</b> для надсилання фото підтвердження."
+            f"⚠️ {mentions}\n\n"
+            f"Дедлайн {dl_time} минув — фото не надійшло!\n"
+            f"Є ще <b>{late_min} хв</b>. Скиньте скрін прямо зараз."
         ),
         parse_mode=ParseMode.HTML,
     )
