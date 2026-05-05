@@ -816,7 +816,11 @@ async def post_init(app: Application) -> None:
     await init_db()
     await check_bot_permissions(app.bot)
     await restore_today_tasks(app)
-    schedule_day_jobs(app)
+    # Щоденне перепланування о 00:01 — schedule_day_jobs не викликаємо тут,
+    # бо restore_today_tasks вже запланував усі jobs на сьогодні
+    now = now_local()
+    tomorrow_midnight = now.replace(hour=0, minute=1, second=0, microsecond=0) + timedelta(days=1)
+    app.job_queue.run_once(job_reschedule_day, when=tomorrow_midnight, name="daily_reschedule")
     log.info("Бот успішно запущено та налаштовано.")
 
 
